@@ -651,6 +651,11 @@ func buildNodeConfig(url *url.URL, m map[string]any) (*config.NodeConfig, error)
 		dialer = schemes[1]
 	}
 
+	// Standard Trojan uses TLS; explicit trojan+transport remains configurable.
+	if len(schemes) == 1 && connector == "trojan" {
+		dialer = "tls"
+	}
+
 	// Path-based address logic must use the requested scheme, not the
 	// registry fallback (unix/serial often remap to http/tcp when only
 	// the CLI registry is partially populated, or in unit tests).

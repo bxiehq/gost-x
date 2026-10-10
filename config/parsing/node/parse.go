@@ -3,6 +3,7 @@ package node
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -377,10 +378,15 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 	connectorLogger := nodeLogger.WithFields(map[string]any{
 		"kind": "connector",
 	})
+	connectorAuth := auth_parser.Info(connCfg.Auth)
+	// Trojan authenticates with a password only, unlike username-based proxies.
+	if connCfg.Type == "trojan" && connectorAuth == nil && connCfg.Auth != nil && connCfg.Auth.Password != "" {
+		connectorAuth = url.UserPassword("", connCfg.Auth.Password)
+	}
 	var cr connector.Connector
 	if rf := registry.ConnectorRegistry().Get(connCfg.Type); rf != nil {
 		cr = rf(
-			connector.AuthOption(auth_parser.Info(connCfg.Auth)),
+			connector.AuthOption(connectorAuth),
 			connector.TLSConfigOption(tlsConfig),
 			connector.LoggerOption(connectorLogger),
 		)
