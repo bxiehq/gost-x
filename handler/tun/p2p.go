@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -220,6 +221,13 @@ type p2pHub struct {
 	overMu    sync.Mutex
 	overCount int
 	overSince time.Time
+
+	// nonIPMu guards the tally that countNonIP keeps. Same shape again: a peer
+	// whose link is losing frame boundaries sends these continuously, and one
+	// line per packet would bury the log it is meant to explain.
+	nonIPMu    sync.Mutex
+	nonIPCount int
+	nonIPSince time.Time
 }
 
 func newP2PHub(device io.ReadWriter, router *peerRouter, ownNets []net.IPNet, warn func(string)) *p2pHub {
@@ -317,13 +325,16 @@ func (h *p2pHub) dispatch(pkt []byte) {
 
 // unroutedWindow is how long unrouted packets are counted before the summary is
 // reported. Long enough that a brief gap is one line, short enough to appear
-// within the same log window as the failure that caused it.
-const unroutedWindow = 5 * time.Second
+// within the same log window as the failure that caused it. A variable, not a
+// constant, so tests can shrink the window.
+var unroutedWindow = 5 * time.Second
 
 // countUnrouted records one unrouted destination and reports the running total
-// at most once per window. dst is reported rather than counted per address: a
-// hub's unrouted traffic is normally one peer (the one whose route is missing),
-// and a map of addresses would be a second routing table to keep honest.
+// at most once per window. The window names the destination that opened it —
+// the first miss after the last report, which is also the one logged at once —
+// rather than counting per address: a hub's unrouted traffic is normally one
+// packet shape (its own MLD noise) plus the peer whose route is missing, and a
+// map of addresses would be a second routing table to keep honest.
 func (h *p2pHub) countUnrouted(dst net.IP) {
 	h.dropMu.Lock()
 	now := time.Now()
@@ -336,6 +347,11 @@ func (h *p2pHub) countUnrouted(dst net.IP) {
 		return
 	}
 	h.dropCount++
+	// The window names the miss that opened it, so the report cannot be stuck
+	// on a destination some earlier window happened to see first.
+	if h.dropDst == "" {
+		h.dropDst = dst.String()
+	}
 	// The window only restarts on a report, so a continuous flood reports once
 	// per window instead of once per packet.
 	if now.Sub(h.dropSince) < unroutedWindow {
@@ -343,7 +359,7 @@ func (h *p2pHub) countUnrouted(dst net.IP) {
 		return
 	}
 	n, since, d := h.dropCount, h.dropSince, h.dropDst
-	h.dropSince, h.dropCount = now, 0
+	h.dropSince, h.dropCount, h.dropDst = now, 0, ""
 	h.dropMu.Unlock()
 	h.warnf("no route for %s, %d packets discarded in %s", d, n,
 		time.Since(since).Round(time.Millisecond).String())
@@ -373,6 +389,59 @@ func (h *p2pHub) countOversize(size int) {
 	h.overMu.Unlock()
 	h.warnf("oversized packets discarded: %d in %s", n,
 		time.Since(since).Round(time.Millisecond).String())
+}
+
+// countNonIP records one frame that was not a parseable IP packet, reporting
+// the first at once and the rest once per window — the same shape as the two
+// tallies above, for the same reason: the condition is a symptom of a link
+// losing its framing, so it arrives in bursts and has to stay countable
+// without becoming the log.
+//
+// The head bytes are logged because a 4-byte frame was seen in the field and
+// its source was never pinned down. channelTag = "P2PU" is exactly 4 bytes,
+// which makes a tag leak the obvious suspect, but the sequence that preceded
+// the sighting -- an untagged inbound delivery after a peek timeout -- was
+// then reproduced 23 times without one, so the suspect is unconfirmed either
+// way. Without the bytes the next occurrence is just another anonymous
+// discard, so they stay.
+func (h *p2pHub) countNonIP(pkt []byte) {
+	h.nonIPMu.Lock()
+	now := time.Now()
+	if h.nonIPSince.IsZero() {
+		h.nonIPSince = now
+		h.nonIPCount = 1
+		h.nonIPMu.Unlock()
+		h.warnf("non-IP frame (%d bytes, head=%s), discarded", len(pkt), headBytes(pkt))
+		return
+	}
+	h.nonIPCount++
+	if now.Sub(h.nonIPSince) < unroutedWindow {
+		h.nonIPMu.Unlock()
+		return
+	}
+	n, since := h.nonIPCount, h.nonIPSince
+	h.nonIPSince, h.nonIPCount = now, 0
+	h.nonIPMu.Unlock()
+	h.warnf("non-IP frames discarded: %d in %s (last head=%s)", n,
+		time.Since(since).Round(time.Millisecond).String(), headBytes(pkt))
+}
+
+// headBytes renders at most the first 8 bytes as hex, so a dropped frame can
+// be identified from the log alone. The remainder is elided rather than
+// truncated silently, so a short frame reads as short.
+func headBytes(pkt []byte) string {
+	n := min(len(pkt), 8)
+	if n == 0 {
+		return "(empty)"
+	}
+	var sb strings.Builder
+	for _, b := range pkt[:n] {
+		fmt.Fprintf(&sb, "%02x ", b)
+	}
+	if len(pkt) > n {
+		sb.WriteString("...")
+	}
+	return sb.String()
 }
 
 // fromSpoke handles one datagram from one peer: a keepalive is answered on the
@@ -450,6 +519,21 @@ func (h *p2pHub) fromSpoke(s *peerStream, pkt []byte) error {
 			h.countUnrouted(dst)
 			return nil
 		}
+	} else {
+		// Not a parseable IPv4 or IPv6 packet, which is the one thing the
+		// kernel is certain to refuse. Measured on a real up tun device: the
+		// version nibble is the *only* thing it inspects — anything but 4 or 6
+		// comes back EINVAL at any length, while 1421, 1500 and 2000-byte
+		// frames with a valid header all go through untouched. So this branch,
+		// not size, is the one that killed the hub: the error left fromSpoke,
+		// unwound Handle, and took a 54-minute peer stream down with it.
+		//
+		// Dropping here is also the symmetric choice: the spoke already refuses
+		// the same frames before its device write (client.go), which is why a
+		// phone logs "unknown packet, discarded" all day and never dies while
+		// the hub had no equivalent.
+		h.countNonIP(pkt)
+		return nil
 	}
 
 	h.wmu.Lock()
