@@ -47,6 +47,21 @@ type HTTPResponseRecorderObject struct {
 	Body          []byte      `json:"body"`
 }
 
+// HTTPAttemptRecorderObject describes one upstream attempt that was discarded
+// because its response opted into a retry. The attempt whose response reaches
+// the client is the recorder object itself and never appears here.
+type HTTPAttemptRecorderObject struct {
+	Attempt        int         `json:"attempt"`
+	Node           string      `json:"node"`
+	StatusCode     int         `json:"statusCode"`
+	Error          string      `json:"error,omitempty"`
+	DurationMS     int64       `json:"durationMs"`
+	BytesIn        int64       `json:"bytesIn"`
+	BytesOut       int64       `json:"bytesOut"`
+	ResponseHeader http.Header `json:"responseHeader,omitempty"`
+	ResponseBody   []byte      `json:"responseBody,omitempty"`
+}
+
 // HTTPRecorderObject holds the recorded HTTP request and response data
 // for a single HTTP transaction.
 type HTTPRecorderObject struct {
@@ -76,6 +91,10 @@ type HTTPRecorderObject struct {
 	// were applied. Nil when no response-side rewrite is configured. For a 101
 	// Switching Protocols response, only headers are captured (there is no body).
 	OriginalResponse *HTTPResponseRecorderObject `json:"originalResponse,omitempty"`
+
+	// Attempts holds the earlier upstream attempts that were discarded in
+	// favour of a retry. The attempt that produced this row is not in the list.
+	Attempts []HTTPAttemptRecorderObject `json:"attempts,omitempty"`
 }
 
 // WebsocketRecorderObject holds the recorded data of a WebSocket frame.
@@ -146,11 +165,15 @@ type HandlerRecorderObject struct {
 	InputBytes  uint64                   `json:"inputBytes"`
 	OutputBytes uint64                   `json:"outputBytes"`
 	Redirect    string                   `json:"redirect,omitempty"`
-	Err         string                   `json:"err,omitempty"`
-	SID         string                   `json:"sid"`
-	Duration    time.Duration            `json:"duration"`
-	Time        time.Time                `json:"time"`
-	RecordMode  string                   `json:"-"` // "" = full, "headers" = metadata only, "off" = no recording
+	// Retries counts the extra upstream attempts made for this recorded
+	// request before the one that produced this row. Zero means the request
+	// was forwarded once.
+	Retries    int           `json:"retries,omitempty"`
+	Err        string        `json:"err,omitempty"`
+	SID        string        `json:"sid"`
+	Duration   time.Duration `json:"duration"`
+	Time       time.Time     `json:"time"`
+	RecordMode string        `json:"-"` // "" = full, "headers" = metadata only, "off" = no recording
 }
 
 // Record serializes the HandlerRecorderObject as JSON and writes it to r.

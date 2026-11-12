@@ -121,6 +121,12 @@ type MetricsConfig struct {
 	Auther string      `yaml:",omitempty" json:"auther,omitempty"`
 }
 
+// DashboardConfig enables the in-process monitoring dashboard read model,
+// exposed by the API service at GET /dashboard/snapshot.
+type DashboardConfig struct {
+	Enabled bool `yaml:",omitempty" json:"enabled,omitempty"`
+}
+
 type TLSConfig struct {
 	CertFile   string      `yaml:"certFile,omitempty" json:"certFile,omitempty"`
 	KeyFile    string      `yaml:"keyFile,omitempty" json:"keyFile,omitempty"`
@@ -175,6 +181,14 @@ type SelectorConfig struct {
 	MaxFails    int           `yaml:"maxFails" json:"maxFails"`
 	FailTimeout time.Duration `yaml:"failTimeout" json:"failTimeout"`
 	MaxLatency  time.Duration `yaml:"maxLatency,omitempty" json:"maxLatency,omitempty"`
+	// MaxParallel limits the number of nodes racing concurrently in a
+	// single connection attempt. It only applies to the parallel strategy.
+	// A value <= 0 means no limit.
+	MaxParallel int `yaml:"maxParallel,omitempty" json:"maxParallel,omitempty"`
+	// ParallelMode selects how the racing nodes are picked from the
+	// candidate pool: "round" (default) or "random". It only applies to the
+	// parallel strategy.
+	ParallelMode string `yaml:"parallelMode,omitempty" json:"parallelMode,omitempty"`
 }
 
 type AdmissionConfig struct {
@@ -205,7 +219,8 @@ type BypassConfig struct {
 }
 
 type FileLoader struct {
-	Path string `json:"path"`
+	Path   string `json:"path"`
+	Format string `yaml:",omitempty" json:"format,omitempty"`
 }
 
 type RedisLoader struct {
@@ -220,6 +235,7 @@ type RedisLoader struct {
 type HTTPLoader struct {
 	URL     string        `yaml:"url" json:"url"`
 	Timeout time.Duration `yaml:",omitempty" json:"timeout,omitempty"`
+	Format  string        `yaml:",omitempty" json:"format,omitempty"`
 }
 
 type NameserverConfig struct {
@@ -798,6 +814,7 @@ type Config struct {
 	Profiling  *ProfilingConfig   `yaml:",omitempty" json:"profiling,omitempty"`
 	API        *APIConfig         `yaml:",omitempty" json:"api,omitempty"`
 	Metrics    *MetricsConfig     `yaml:",omitempty" json:"metrics,omitempty"`
+	Dashboard  *DashboardConfig   `yaml:",omitempty" json:"dashboard,omitempty"`
 }
 
 func (c *Config) Load() error {

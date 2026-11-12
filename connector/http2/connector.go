@@ -5,18 +5,17 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"time"
 
 	"github.com/go-gost/core/connector"
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
+	"github.com/go-gost/x/internal/net/httptunnel"
 	"github.com/go-gost/x/registry"
 )
 
@@ -66,7 +65,12 @@ func (c *http2Connector) Connect(ctx context.Context, conn net.Conn, network, ad
 		return nil, err
 	}
 
-	pr, pw := io.Pipe()
+	// The request body is the client-to-server half of the tunnel. Nothing is
+	// written to it before Connect returns, so when the transport retries the
+	// request on another connection a fresh pipe is an exact replacement.
+	// Without GetBody the retry reuses the body the first attempt already
+	// closed (golang/go#82177).
+	body := httptunnel.NewBody()
 	req := &http.Request{
 		Method:     http.MethodConnect,
 		URL:        &url.URL{Scheme: "https", Host: conn.RemoteAddr().String()},
@@ -74,7 +78,8 @@ func (c *http2Connector) Connect(ctx context.Context, conn net.Conn, network, ad
 		ProtoMajor: 2,
 		ProtoMinor: 0,
 		Header:     c.md.header,
-		Body:       pr,
+		Body:       body.Reader(),
+		GetBody:    body.GetBody,
 	}
 	if req.Header == nil {
 		req.Header = make(http.Header)
@@ -92,13 +97,30 @@ func (c *http2Connector) Connect(ctx context.Context, conn net.Conn, network, ad
 		log.Trace(string(dump))
 	}
 
+	connectCtx := ctx
 	if c.md.connectTimeout > 0 {
-		conn.SetDeadline(time.Now().Add(c.md.connectTimeout))
-		defer conn.SetDeadline(time.Time{})
+		var cancel context.CancelFunc
+		connectCtx, cancel = context.WithTimeout(ctx, c.md.connectTimeout)
+		defer cancel()
 	}
 
-	resp, err := client.Do(req.WithContext(context.WithoutCancel(ctx)))
+	// Honor cancellation until CONNECT response headers arrive, while allowing
+	// an established tunnel to outlive the caller's connection setup context.
+	requestCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	stopCancel := context.AfterFunc(connectCtx, cancel)
+	resp, err := client.Do(req.WithContext(requestCtx))
+	stopCancel()
+	// AfterFunc may already be running. In that case the context is done and
+	// this stream must not be returned as a successful connection.
+	if connectCtx.Err() != nil {
+		err = connectCtx.Err()
+	}
 	if err != nil {
+		cancel()
+		body.CloseWithError(err)
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
 		log.Error(err)
 		conn.Close()
 		return nil, err
@@ -109,15 +131,18 @@ func (c *http2Connector) Connect(ctx context.Context, conn net.Conn, network, ad
 		log.Trace(string(dump))
 	}
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
 		err = fmt.Errorf("%s", resp.Status)
+		cancel()
+		body.CloseWithError(err)
+		resp.Body.Close()
 		log.Error(err)
 		return nil, err
 	}
 
 	hc := &http2Conn{
+		cancel:    cancel,
 		r:         resp.Body,
-		w:         pw,
+		w:         body.Writer(),
 		localAddr: conn.RemoteAddr(),
 	}
 

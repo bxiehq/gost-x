@@ -1,0 +1,450 @@
+package chain
+
+import (
+	"context"
+	"errors"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/go-gost/core/chain"
+	"github.com/go-gost/core/dialer"
+	"github.com/go-gost/core/hosts"
+	xlogger "github.com/go-gost/x/logger"
+	xmetrics "github.com/go-gost/x/metrics"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/require"
+)
+
+type routeHostMapper struct {
+	m map[string][]net.IP
+}
+
+func (h *routeHostMapper) Lookup(ctx context.Context, network, host string, opts ...hosts.Option) ([]net.IP, bool) {
+	ips, ok := h.m[host]
+	return ips, ok
+}
+
+// newFailoverNode builds a single node whose host resolves to two IPs
+// (10.0.0.1, 10.0.0.2) and records every dialed address in dialed.
+func newFailoverNode(t *testing.T, nodeAddr, host string, shouldFail func(addr string) bool, dialed *[]string, mu *sync.Mutex) (*chain.Node, *chainRoute) {
+	t.Helper()
+	d := &testDialer{dialFn: func(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+		mu.Lock()
+		*dialed = append(*dialed, addr)
+		mu.Unlock()
+		if shouldFail(addr) {
+			return nil, errors.New("dial failed")
+		}
+		return &testConn{}, nil
+	}}
+	node := chain.NewNode("n1", nodeAddr,
+		chain.TransportNodeOption(NewTransport(d, &plainConnector{})),
+		chain.HostMapperNodeOption(&routeHostMapper{m: map[string][]net.IP{
+			host: {net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2")},
+		}}),
+	)
+	rt := NewRoute()
+	rt.addNode(node)
+	return node, rt
+}
+
+func containsAddr(dialed []string, addr string) bool {
+	for _, v := range dialed {
+		if v == addr {
+			return true
+		}
+	}
+	return false
+}
+
+func TestChainRoute_Connect_FailoverToSecondCandidate(t *testing.T) {
+	var mu sync.Mutex
+	var dialed []string
+	_, rt := newFailoverNode(t, "failover-1.test:443", "failover-1.test",
+		func(addr string) bool { return addr == "10.0.0.1:443" }, &dialed, &mu)
+
+	// Candidates are shuffled, so keep connecting until the broken one has
+	// been tried at least once; every attempt must still succeed.
+	for i := 0; i < 50; i++ {
+		dialed = nil
+		conn, err := rt.connect(context.Background(), xlogger.Nop())
+		require.NoError(t, err)
+		require.NotNil(t, conn)
+		if containsAddr(dialed, "10.0.0.1:443") {
+			require.Equal(t, []string{"10.0.0.1:443", "10.0.0.2:443"}, dialed)
+			return
+		}
+	}
+	t.Fatal("failing candidate was never dialed")
+}
+
+func TestChainRoute_Connect_SpreadAcrossHealthyCandidates(t *testing.T) {
+	var mu sync.Mutex
+	var dialed []string
+	_, rt := newFailoverNode(t, "failover-spread.test:443", "failover-spread.test",
+		func(string) bool { return false }, &dialed, &mu)
+
+	first := map[string]int{}
+	for i := 0; i < 50; i++ {
+		dialed = nil
+		_, err := rt.connect(context.Background(), xlogger.Nop())
+		require.NoError(t, err)
+		require.Len(t, dialed, 1)
+		first[dialed[0]]++
+	}
+	require.Contains(t, first, "10.0.0.1:443")
+	require.Contains(t, first, "10.0.0.2:443")
+}
+
+func TestChainRoute_Connect_DeprioritizesFailedCandidate(t *testing.T) {
+	var mu sync.Mutex
+	var dialed []string
+	_, rt := newFailoverNode(t, "failover-deprio.test:443", "failover-deprio.test",
+		func(addr string) bool { return addr == "10.0.0.1:443" }, &dialed, &mu)
+
+	// Warm up until the broken candidate has failed once.
+	failed := false
+	for i := 0; i < 50 && !failed; i++ {
+		dialed = nil
+		_, err := rt.connect(context.Background(), xlogger.Nop())
+		require.NoError(t, err)
+		failed = containsAddr(dialed, "10.0.0.1:443")
+	}
+	require.True(t, failed, "broken candidate was never dialed")
+
+	// Once marked, the healthy candidate must always be tried first.
+	for i := 0; i < 20; i++ {
+		dialed = nil
+		_, err := rt.connect(context.Background(), xlogger.Nop())
+		require.NoError(t, err)
+		require.Equal(t, "10.0.0.2:443", dialed[0])
+	}
+}
+
+func TestChainRoute_Connect_AllCandidatesFail(t *testing.T) {
+	var mu sync.Mutex
+	var dialed []string
+	node, rt := newFailoverNode(t, "failover-allfail.test:443", "failover-allfail.test",
+		func(string) bool { return true }, &dialed, &mu)
+
+	conn, err := rt.connect(context.Background(), xlogger.Nop())
+	require.Error(t, err)
+	require.Nil(t, conn)
+	require.Len(t, dialed, 2)
+	require.EqualValues(t, 1, node.Marker().Count())
+}
+
+func TestOrderCandidates_ExpiresAfterTTL(t *testing.T) {
+	oldNow, oldTTL := timeNow, addrFailTTL
+	t.Cleanup(func() { timeNow, addrFailTTL = oldNow, oldTTL })
+
+	failedAt := time.Now()
+	timeNow = func() time.Time { return failedAt }
+	addrFailTTL = 30 * time.Second
+
+	nodeAddr := "failover-ttl.test:443"
+	markAddrFailed(nodeAddr, "10.0.0.1:443")
+	require.Equal(t, "10.0.0.2:443", orderCandidates(nodeAddr, []string{"10.0.0.1:443", "10.0.0.2:443"})[0])
+
+	timeNow = func() time.Time { return failedAt.Add(31 * time.Second) }
+	require.Len(t, orderCandidates(nodeAddr, []string{"10.0.0.1:443", "10.0.0.2:443"}), 2)
+	_, ok := failedAddrs.Load(addrKey(nodeAddr, "10.0.0.1:443"))
+	require.False(t, ok, "expired failure record must be dropped")
+}
+
+func TestMarkAddrOK_ClearsFailure(t *testing.T) {
+	nodeAddr := "failover-ok.test:443"
+	markAddrFailed(nodeAddr, "10.0.0.1:443")
+	markAddrOK(nodeAddr, "10.0.0.1:443")
+	_, ok := failedAddrs.Load(addrKey(nodeAddr, "10.0.0.1:443"))
+	require.False(t, ok)
+}
+
+func TestChainRoute_Connect_HandshakeFailureDeprioritizes(t *testing.T) {
+	var mu sync.Mutex
+	var dialed []string
+	var lastDialed string
+	d := &testDialer{dialFn: func(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		lastDialed = addr
+		mu.Unlock()
+		return &testConn{}, nil
+	}}
+	c := &testConnector{handshakeFn: func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		if lastDialed == "10.0.0.1:443" {
+			return nil, errors.New("handshake failed")
+		}
+		return conn, nil
+	}}
+	node := chain.NewNode("n1", "failover-hs.test:443",
+		chain.TransportNodeOption(NewTransport(d, c)),
+		chain.HostMapperNodeOption(&routeHostMapper{m: map[string][]net.IP{
+			"failover-hs.test": {net.ParseIP("10.0.0.1"), net.ParseIP("10.0.0.2")},
+		}}),
+	)
+	rt := NewRoute()
+	rt.addNode(node)
+
+	failed := false
+	for i := 0; i < 50 && !failed; i++ {
+		dialed = nil
+		_, err := rt.connect(context.Background(), xlogger.Nop())
+		require.NoError(t, err)
+		failed = containsAddr(dialed, "10.0.0.1:443")
+	}
+	require.True(t, failed, "handshake-failing candidate was never tried")
+
+	for i := 0; i < 20; i++ {
+		dialed = nil
+		_, err := rt.connect(context.Background(), xlogger.Nop())
+		require.NoError(t, err)
+		require.Equal(t, "10.0.0.2:443", dialed[0])
+	}
+}
+
+type retryableHandshakeError struct{}
+
+func (retryableHandshakeError) Error() string            { return "retryable handshake failure" }
+func (retryableHandshakeError) RetryableHandshake() bool { return true }
+
+func TestChainRoute_Connect_RetryableHandshakeRetriesSameAddr(t *testing.T) {
+	var mu sync.Mutex
+	var dialed []string
+	attempts := 0
+	d := &testDialer{dialFn: func(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+		mu.Lock()
+		dialed = append(dialed, addr)
+		mu.Unlock()
+		return &testConn{}, nil
+	}}
+	c := &testConnector{handshakeFn: func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, retryableHandshakeError{}
+		}
+		return conn, nil
+	}}
+	node := chain.NewNode("n1", "retry.test:443",
+		chain.TransportNodeOption(NewTransport(d, c)),
+		chain.HostMapperNodeOption(&routeHostMapper{m: map[string][]net.IP{
+			"retry.test": {net.ParseIP("10.0.0.1")},
+		}}),
+	)
+	rt := NewRoute()
+	rt.addNode(node)
+	conn, err := rt.connect(context.Background(), xlogger.Nop())
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, 2, attempts)
+	require.Equal(t, 0, int(node.Marker().Count()))
+	_, ok := failedAddrs.Load(addrKey("retry.test:443", "10.0.0.1:443"))
+	require.False(t, ok)
+}
+
+func TestChainRoute_Connect_RetryableThenFails(t *testing.T) {
+	attempts := 0
+	d := &testDialer{dialFn: func(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+		return &testConn{}, nil
+	}}
+	c := &testConnector{handshakeFn: func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		attempts++
+		return nil, retryableHandshakeError{}
+	}}
+	node := chain.NewNode("n1", "retry2.test:443", chain.TransportNodeOption(NewTransport(d, c)),
+		chain.HostMapperNodeOption(&routeHostMapper{m: map[string][]net.IP{"retry2.test": {net.ParseIP("10.0.0.1")}}}))
+	rt := NewRoute()
+	rt.addNode(node)
+	_, err := rt.connect(context.Background(), xlogger.Nop())
+	require.Error(t, err)
+	require.Equal(t, 2, attempts)
+	require.Equal(t, int64(1), node.Marker().Count())
+}
+
+func TestChainRoute_Connect_NonRetryableHandshakeNoRetry(t *testing.T) {
+	attempts := 0
+	d := &testDialer{dialFn: func(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+		return &testConn{}, nil
+	}}
+	c := &testConnector{handshakeFn: func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		attempts++
+		return nil, errors.New("boom")
+	}}
+	node := chain.NewNode("n1", "nr.test:443", chain.TransportNodeOption(NewTransport(d, c)),
+		chain.HostMapperNodeOption(&routeHostMapper{m: map[string][]net.IP{"nr.test": {net.ParseIP("10.0.0.1")}}}))
+	rt := NewRoute()
+	rt.addNode(node)
+	_, err := rt.connect(context.Background(), xlogger.Nop())
+	require.Error(t, err)
+	require.Equal(t, 1, attempts)
+}
+
+func TestChainRoute_Connect_RetryableDialRetriesSameAddr(t *testing.T) {
+	attempts := 0
+	d := &testDialer{dialFn: func(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, retryableHandshakeError{}
+		}
+		return &testConn{}, nil
+	}}
+	c := &testConnector{handshakeFn: func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		return conn, nil
+	}}
+	node := chain.NewNode("n1", "retryd.test:443", chain.TransportNodeOption(NewTransport(d, c)),
+		chain.HostMapperNodeOption(&routeHostMapper{m: map[string][]net.IP{"retryd.test": {net.ParseIP("10.0.0.1")}}}))
+	rt := NewRoute()
+	rt.addNode(node)
+	conn, err := rt.connect(context.Background(), xlogger.Nop())
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	require.Equal(t, 2, attempts)
+	require.Equal(t, 0, int(node.Marker().Count()))
+	_, ok := failedAddrs.Load(addrKey("retryd.test:443", "10.0.0.1:443"))
+	require.False(t, ok)
+}
+
+func TestChainRoute_Connect_RetryableDialThenFails(t *testing.T) {
+	attempts := 0
+	d := &testDialer{dialFn: func(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+		attempts++
+		return nil, retryableHandshakeError{}
+	}}
+	c := &testConnector{handshakeFn: func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		return conn, nil
+	}}
+	node := chain.NewNode("n1", "retryd2.test:443", chain.TransportNodeOption(NewTransport(d, c)),
+		chain.HostMapperNodeOption(&routeHostMapper{m: map[string][]net.IP{"retryd2.test": {net.ParseIP("10.0.0.1")}}}))
+	rt := NewRoute()
+	rt.addNode(node)
+	_, err := rt.connect(context.Background(), xlogger.Nop())
+	require.Error(t, err)
+	require.Equal(t, 2, attempts)
+	require.Equal(t, int64(1), node.Marker().Count())
+}
+
+func TestChainRoute_Connect_NonRetryableDialNoRetry(t *testing.T) {
+	attempts := 0
+	d := &testDialer{dialFn: func(ctx context.Context, addr string, opts ...dialer.DialOption) (net.Conn, error) {
+		attempts++
+		return nil, errors.New("boom")
+	}}
+	c := &testConnector{handshakeFn: func(ctx context.Context, conn net.Conn) (net.Conn, error) {
+		return conn, nil
+	}}
+	node := chain.NewNode("n1", "nrd.test:443", chain.TransportNodeOption(NewTransport(d, c)),
+		chain.HostMapperNodeOption(&routeHostMapper{m: map[string][]net.IP{"nrd.test": {net.ParseIP("10.0.0.1")}}}))
+	rt := NewRoute()
+	rt.addNode(node)
+	_, err := rt.connect(context.Background(), xlogger.Nop())
+	require.Error(t, err)
+	require.Equal(t, 1, attempts)
+}
+
+func findChainMetric(t *testing.T, family, chainName, nodeName string) *dto.Metric {
+	t.Helper()
+	mfs, err := xmetrics.Registry().Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		if mf.GetName() != family {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := make(map[string]string)
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["chain"] == chainName && labels["node"] == nodeName {
+				return m
+			}
+		}
+	}
+	return nil
+}
+
+func TestChainRoute_Connect_ErrorAttributedToFailingHop(t *testing.T) {
+	orig := xmetrics.IsEnabled()
+	xmetrics.Enable(true)
+	defer xmetrics.Enable(orig)
+
+	chainName := "test-route-error-hop"
+	c := NewChain(chainName)
+	node1 := chain.NewNode("hop-1", "127.0.0.1:8080",
+		chain.TransportNodeOption(NewTransport(&testDialer{}, &testConnector{})))
+	node2 := chain.NewNode("hop-2", "127.0.0.1:9090",
+		chain.TransportNodeOption(NewTransport(&testDialer{
+			handshakeFn: func(ctx context.Context, conn net.Conn, opts ...dialer.HandshakeOption) (net.Conn, error) {
+				return nil, errors.New("handshake failed")
+			},
+		}, &testConnector{})))
+	rt := NewRoute(ChainRouteOption(c))
+	rt.addNode(node1, node2)
+
+	_, err := rt.Dial(context.Background(), "tcp", "127.0.0.1:80")
+	require.Error(t, err)
+
+	m := findChainMetric(t, string(xmetrics.MetricChainErrorsCounter), chainName, "hop-2")
+	require.NotNil(t, m, "expected error metric for hop-2")
+	require.Equal(t, float64(1), m.GetCounter().GetValue())
+	require.Nil(t, findChainMetric(t, string(xmetrics.MetricChainErrorsCounter), chainName, "hop-1"))
+
+	d := findChainMetric(t, string(xmetrics.MetricNodeConnectDurationObserver), chainName, "hop-1")
+	require.NotNil(t, d, "expected duration metric for successful hop-1")
+	require.Equal(t, uint64(1), d.GetHistogram().GetSampleCount())
+	require.Nil(t, findChainMetric(t, string(xmetrics.MetricNodeConnectDurationObserver), chainName, "hop-2"))
+}
+
+func TestChainRoute_Connect_FirstNodeErrorAttributedToFirstHop(t *testing.T) {
+	orig := xmetrics.IsEnabled()
+	xmetrics.Enable(true)
+	defer xmetrics.Enable(orig)
+
+	chainName := "test-route-error-first"
+	c := NewChain(chainName)
+	node := chain.NewNode("hop-1", "127.0.0.1:8080",
+		chain.TransportNodeOption(NewTransport(&testDialer{
+			handshakeFn: func(ctx context.Context, conn net.Conn, opts ...dialer.HandshakeOption) (net.Conn, error) {
+				return nil, errors.New("handshake failed")
+			},
+		}, &testConnector{})))
+	rt := NewRoute(ChainRouteOption(c))
+	rt.addNode(node)
+
+	_, err := rt.Dial(context.Background(), "tcp", "127.0.0.1:80")
+	require.Error(t, err)
+
+	m := findChainMetric(t, string(xmetrics.MetricChainErrorsCounter), chainName, "hop-1")
+	require.NotNil(t, m, "expected error metric for hop-1")
+	require.Equal(t, float64(1), m.GetCounter().GetValue())
+	require.Nil(t, findChainMetric(t, string(xmetrics.MetricNodeConnectDurationObserver), chainName, "hop-1"))
+}
+
+func TestChainRoute_Connect_PerHopDurationObserved(t *testing.T) {
+	orig := xmetrics.IsEnabled()
+	xmetrics.Enable(true)
+	defer xmetrics.Enable(orig)
+
+	chainName := "test-route-duration-hops"
+	c := NewChain(chainName)
+	node1 := chain.NewNode("hop-1", "127.0.0.1:8080",
+		chain.TransportNodeOption(NewTransport(&testDialer{}, &testConnector{})))
+	node2 := chain.NewNode("hop-2", "127.0.0.1:9090",
+		chain.TransportNodeOption(NewTransport(&testDialer{}, &testConnector{})))
+	rt := NewRoute(ChainRouteOption(c))
+	rt.addNode(node1, node2)
+
+	conn, err := rt.Dial(context.Background(), "tcp", "127.0.0.1:80")
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	conn.Close()
+
+	for _, name := range []string{"hop-1", "hop-2"} {
+		m := findChainMetric(t, string(xmetrics.MetricNodeConnectDurationObserver), chainName, name)
+		require.NotNil(t, m, "expected duration metric for %s", name)
+		require.Equal(t, uint64(1), m.GetHistogram().GetSampleCount())
+	}
+	require.Nil(t, findChainMetric(t, string(xmetrics.MetricChainErrorsCounter), chainName, "hop-1"))
+	require.Nil(t, findChainMetric(t, string(xmetrics.MetricChainErrorsCounter), chainName, "hop-2"))
+}

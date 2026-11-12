@@ -4,6 +4,7 @@ import (
 	"time"
 
 	mdata "github.com/go-gost/core/metadata"
+	"github.com/go-gost/x/internal/util/ech"
 	mdutil "github.com/go-gost/x/metadata/util"
 )
 
@@ -14,6 +15,8 @@ type metadata struct {
 	keepaliveIdle     time.Duration
 	keepaliveInterval time.Duration
 	keepaliveCount    int
+
+	ech ech.Config
 }
 
 func (d *tlsDialer) parseMetadata(md mdata.Metadata) (err error) {
@@ -27,6 +30,8 @@ func (d *tlsDialer) parseMetadata(md mdata.Metadata) (err error) {
 	d.md.keepaliveIdle = mdutil.GetDuration(md, "keepalive.idle")
 	d.md.keepaliveInterval = mdutil.GetDuration(md, "keepalive.interval")
 	d.md.keepaliveCount = mdutil.GetInt(md, "keepalive.count")
+
+	d.md.ech = ech.FromMetadata(md)
 
 	return
 }

@@ -62,6 +62,12 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 		return err
 	}
 
+	if ho.ClientID != nil {
+		if id := strings.TrimSpace(ho.ClientID(req)); id != "" {
+			ctx = xctx.ContextWithClientID(ctx, xctx.ClientID(id))
+		}
+	}
+
 	log := ho.Log
 	if log.IsLevelEnabled(logger.TraceLevel) {
 		dump, _ := httputil.DumpRequest(req, false)
@@ -95,6 +101,25 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 		upstreamHost string
 	)
 
+	// Retry state belongs to one client request: attempt is the zero-based
+	// upstream attempt index, rs carries the remaining budget plus the
+	// replayable request. Both are reset when the keep-alive loop reads the
+	// next request.
+	var (
+		attempt int
+		rs      *retryState
+	)
+
+	// Close the current upstream connection when the handler returns. The
+	// keep-alive loop may dial several upstream connections when the request
+	// host changes; each previous one is closed in place and set to nil, so
+	// this deferred close only owns the last live connection.
+	defer func() {
+		if cc != nil {
+			cc.Close()
+		}
+	}()
+
 	for {
 		// Authorize this request against the bypass in effect now. The check
 		// inside dial only runs when a new upstream connection is needed, so
@@ -105,6 +130,7 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 				bypass.WithPathOption(req.RequestURI)); err != nil {
 				if cc != nil {
 					cc.Close()
+					cc = nil
 				}
 				return err
 			}
@@ -122,13 +148,18 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 				Header:        req.Header.Clone(),
 			},
 		}
+		// A retry continues the loop, so re-attach the attempts already
+		// discarded for this request; the fresh object above drops them.
+		if rs != nil {
+			ro.HTTP.Attempts = rs.attempts
+		}
 
 		// --- Cache check before any upstream dial ---
 		var (
 			staleResp *http.Response
 			freshHit  bool
 		)
-		if h.Cache != nil && h.Cache.CacheableRequest(req) {
+		if h.Cache != nil && h.Cache.CacheableRequest(req) && (rs == nil || rs.retries == 0) {
 			if cachedResp, stale, ok := h.Cache.Lookup(ctx, req); ok {
 				if !stale {
 					if h.serveCachedResponse(ctx, conn, req, cachedResp, ro, log) {
@@ -145,6 +176,13 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 		if !freshHit {
 			if cc == nil {
 				var dialRes *http.Response
+				// Take the attempt start before the dial: the retry state for
+				// the first attempt is only built once the dial resolves, and
+				// its duration must still cover the connect.
+				dialStart := time.Now()
+				if rs != nil {
+					rs.attemptStart = dialStart
+				}
 				node, cc, dialRes, err = h.dial(ctx, req, &ho)
 				if err != nil {
 					// Prefer serving a stale cached entry over surfacing the
@@ -158,6 +196,44 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 					if staleResp != nil && staleResp.Body != nil {
 						staleResp.Body.Close()
 					}
+					// Nothing was written to the upstream yet, so a failed
+					// connect is retryable: dial already marked the node, spend
+					// one unit of budget and let the loop select again. The
+					// budget is only spent once the replay is known good, so a
+					// failed replay cannot record a retry that never happened.
+					if rs == nil {
+						rs = newRetryState(req, node)
+					}
+					if rs != nil {
+						// The state is built after the dial resolved, so the
+						// failed connect is timed from dialStart.
+						rs.attemptStart = dialStart
+					}
+					if rs != nil && rs.budget > 0 {
+						if replay, rerr := replayRetryRequest(rs.replay); rerr == nil {
+							rs.addAttempt(xrecorder.HTTPAttemptRecorderObject{
+								Attempt:    attempt,
+								Node:       nodeName(node),
+								StatusCode: 0,
+								Error:      err.Error(),
+								DurationMS: time.Since(rs.attemptStart).Milliseconds(),
+							})
+							ro.HTTP.Attempts = rs.attempts
+							rs.budget--
+							rs.retries++
+							ho.RecorderObject.Retries = rs.retries
+							attempt++
+							req = replay
+							cc = nil
+							continue
+						}
+					}
+					if rs != nil {
+						// One row covers every attempt, so its duration starts
+						// with the first one.
+						ro.Time = rs.start
+					}
+					h.recordDialFailure(ctx, req, ro, dialRes, err, log)
 					if dialRes != nil {
 						dialRes.Write(conn)
 					}
@@ -171,12 +247,52 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 
 				ro.SrcAddr = cc.LocalAddr().String()
 				ro.DstAddr = cc.RemoteAddr().String()
+
+				if rs == nil {
+					// The selected node opts in to retries: buffer the pristine
+					// client request so a later attempt can be replayed against
+					// another node.
+					rs = newRetryState(req, node)
+				}
+				if rs != nil {
+					// The state is created after the connect, so the first
+					// attempt is timed from the dial start.
+					rs.attemptStart = dialStart
+				}
+			}
+
+			if rs == nil && node != nil {
+				// A reused upstream connection skips dial and therefore the
+				// node select, so the node retained from the dial that opened
+				// it carries the retry policy. A retry drops cc, so the next
+				// attempt re-selects.
+				rs = newRetryState(req, node)
 			}
 
 			// --- Forward request and cache response ---
-			shouldClose, err := h.httpRoundTrip(ctx, xio.NewReadWriteCloser(br, conn, conn), cc, node, req, &pStats, &ho, staleResp)
+			shouldClose, retry, err := h.httpRoundTrip(withAttempt(ctx, attempt), xio.NewReadWriteCloser(br, conn, conn), cc, node, req, &pStats, &ho, staleResp, rs)
 			if staleResp != nil && staleResp.Body != nil {
 				staleResp.Body.Close()
+			}
+			if retry {
+				// The attempt was discarded and its node is marked:
+				// httpRoundTrip already skipped recording, so spend one unit of
+				// budget, drop the upstream connection and replay the pristine
+				// request. The next loop iteration re-selects a node.
+				rs.budget--
+				rs.retries++
+				ho.RecorderObject.Retries = rs.retries
+				if cc != nil {
+					cc.Close()
+					cc = nil
+				}
+				attempt++
+				replay, rerr := replayRetryRequest(rs.replay)
+				if rerr != nil {
+					return rerr
+				}
+				req = replay
+				continue
 			}
 			if err != nil || shouldClose {
 				return err
@@ -197,9 +313,16 @@ func (h *Sniffer) HandleHTTP(ctx context.Context, conn net.Conn, opts ...HandleO
 			log.Trace(string(dump))
 		}
 
+		// The retry budget, attempt index and recorded retry count belong to
+		// the request that just completed; the next one starts from zero.
+		attempt, rs = 0, nil
+		ho.RecorderObject.Retries = 0
+
 		// Re-dial on host change (DNS override reuses same conn for same host).
 		if reqHost := normalizeHost(req.Host, "80"); reqHost != "" && reqHost != upstreamHost {
-			cc.Close()
+			if cc != nil {
+				cc.Close()
+			}
 			cc = nil
 			ro.Host = reqHost
 
@@ -325,7 +448,8 @@ func resolveHTTPNode(ctx context.Context, host string, req *http.Request, ho *Ha
 // dial selects a node and establishes a connection. It does NOT write the
 // error response to conn; instead it returns res (nil on a plain dial failure)
 // so the caller can choose between serving a stale cached response and writing
-// the error response.
+// the error response. On a connect failure the selected node is returned with
+// the error, and it is already marked.
 func (h *Sniffer) dial(ctx context.Context, req *http.Request, ho *HandleOptions) (node *chain.Node, cc net.Conn, res *http.Response, err error) {
 	dial := ho.Dial
 	if dial == nil {
@@ -373,21 +497,71 @@ func (h *Sniffer) dial(ctx context.Context, req *http.Request, ho *HandleOptions
 			marker.Mark()
 		}
 		ho.Log.Warnf("connect to node %s(%s) failed: %v", node.Name, node.Addr, err)
-		return nil, nil, res, err
+		// Return the selected node alongside the error so the caller can read
+		// its retry metadata while the failed attempt is still current.
+		return node, nil, res, err
 	}
-	if marker := node.Marker(); marker != nil {
-		marker.Reset()
-	}
+	// A successful connect is not a healthy node: the node is only known to
+	// be serving once it returns a non-failCodes response (see
+	// httpRoundTrip). Resetting the marker here would run before every
+	// request whenever the upstream connection is not kept alive, erasing the
+	// failCodes count each time, so a maxFails > 1 threshold could never be
+	// reached.
 
 	cc = tlsWrapConn(cc, node.Options().TLS)
 	return node, cc, nil, nil
 }
 
+// closeOnErrorWriter closes the upstream connection when writing the response
+// to the client fails. http.Response.Write defers Body.Close, and for a
+// server-side response that drain waits for the upstream body to end; with an
+// endless stream the handler would never return after a client disconnect,
+// leaking both the goroutine and the upstream socket.
+type closeOnErrorWriter struct {
+	w    io.Writer
+	conn io.Closer
+}
+
+func (w closeOnErrorWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	if err != nil && w.conn != nil {
+		w.conn.Close()
+	}
+	return n, err
+}
+
+// upstreamBodyIdleTimeout bounds how long the handler waits for the next
+// upstream body chunk. Without it, a client that disconnects while the
+// upstream stream is silent leaves the handler blocked in Read forever.
+var upstreamBodyIdleTimeout = 60 * time.Second
+
+type deadlineSetter interface {
+	SetReadDeadline(time.Time) error
+}
+
+// idleBody refreshes the upstream read deadline on every Read so a stalled
+// stream cannot pin the handler indefinitely.
+type idleBody struct {
+	io.ReadCloser
+	conn deadlineSetter
+	idle time.Duration
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	if b.conn != nil && b.idle > 0 {
+		b.conn.SetReadDeadline(time.Now().Add(b.idle))
+	}
+	return b.ReadCloser.Read(p)
+}
+
 // httpRoundTrip forwards a single HTTP request/response pair and records
-// traffic metadata. Returns whether the connection should be closed.
+// traffic metadata. Returns whether the connection should be closed, and
+// whether this attempt was discarded in favour of a retry (in which case
+// nothing was written to the client and no row was recorded).
 // staleResp, when non-nil, is written to the client on upstream read failure
-// when the cache policy enables serve-stale.
-func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, node *chain.Node, req *http.Request, pStats stats.Stats, ho *HandleOptions, staleResp *http.Response) (shouldClose bool, err error) {
+// when the cache policy enables serve-stale. rs carries the retry budget for
+// the request and is nil when the request is not retryable.
+func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, node *chain.Node, req *http.Request, pStats stats.Stats, ho *HandleOptions, staleResp *http.Response, rs *retryState) (shouldClose, retry bool, err error) {
 	shouldClose = true
 
 	// Cache key identity is derived from the client's request (method + Host +
@@ -400,9 +574,20 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 	ro := &xrecorder.HandlerRecorderObject{}
 	*ro = *ho.RecorderObject
 
-	ro.Time = time.Now()
+	if rs != nil {
+		// One row covers every attempt of the request, so it starts with the
+		// first one rather than with this attempt.
+		ro.Time = rs.start
+	} else {
+		ro.Time = time.Now()
+	}
 	log.Infof("%s <-> %s", ro.RemoteAddr, req.Host)
 	defer func() {
+		if retry {
+			// The attempt is discarded: only the attempt whose response
+			// reaches the client records a row.
+			return
+		}
 		if err != nil {
 			ro.Err = err.Error()
 		}
@@ -430,6 +615,11 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 			ContentLength: req.ContentLength,
 			Header:        req.Header.Clone(),
 		},
+	}
+	// One row covers every attempt of the request, so the row recorded below
+	// carries the earlier attempts that were discarded for a retry.
+	if rs != nil {
+		ro.HTTP.Attempts = rs.attempts
 	}
 
 	// Capture pre-rewrite originals only when this node actually configures a
@@ -598,7 +788,42 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		break
 	}
 	defer resp.Body.Close()
+
+	// A response whose status opts into retries is discarded here, before any
+	// failCodes handling, rewrite, caching or client write: the node is marked
+	// so the selector skips it and HandleHTTP replays the request against the
+	// next one. A 101 has already switched protocols, so it is never retried.
+	if rs != nil && rs.budget > 0 &&
+		resp.StatusCode != http.StatusSwitchingProtocols &&
+		rs.codes.Match(resp.StatusCode) {
+		if marker := node.Marker(); marker != nil {
+			marker.Mark()
+		}
+		log.Warnf("retryable status %d for node %s", resp.StatusCode, node.Name)
+		// Keep a bounded preview of the discarded response so the recorded
+		// row can explain the retry. The read error is expected when the
+		// upstream cuts the body short; whatever arrived is still kept.
+		// Bound the read separately from the header deadline: the connection
+		// is dropped on this path, so the deadline is not restored.
+		xio.SetReadDeadline(cc, time.Now().Add(attemptPreviewTimeout))
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, attemptBodyLimit))
+		rs.addAttempt(xrecorder.HTTPAttemptRecorderObject{
+			Attempt:        attemptFromContext(ctx),
+			Node:           node.Name,
+			StatusCode:     resp.StatusCode,
+			DurationMS:     time.Since(rs.attemptStart).Milliseconds(),
+			BytesIn:        req.ContentLength,
+			BytesOut:       resp.ContentLength,
+			ResponseHeader: resp.Header.Clone(),
+			ResponseBody:   preview,
+		})
+		return false, true, nil
+	}
+
 	xio.SetReadDeadline(cc, time.Time{})
+	if ds, ok := cc.(deadlineSetter); ok && upstreamBodyIdleTimeout > 0 {
+		resp.Body = &idleBody{ReadCloser: resp.Body, conn: ds, idle: upstreamBodyIdleTimeout}
+	}
 
 	if hasRespRewrite {
 		ro.HTTP.OriginalResponse = &xrecorder.HTTPResponseRecorderObject{
@@ -617,12 +842,31 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 	// failCodes: a matching upstream status marks the node failed so the
 	// selector's FailFilter skips it. The response still relays to the client;
 	// closing the connection makes the next client request re-select a node.
-	if hts := node.Options().HTTP; hts != nil && hts.FailCodes.Match(resp.StatusCode) {
-		log.Warnf("failCodes matched status %d for node %s", resp.StatusCode, node.Name)
+	//
+	// A retry code is a failure even once the retry budget is exhausted and
+	// even when it is absent from failCodes: the retry branch above only marks
+	// while budget remains, so without this the final attempt of such a status
+	// would clear the marker and leave a node selectable that just refused to
+	// serve the request.
+	hts := node.Options().HTTP
+	failCodeHit := hts != nil && hts.FailCodes.Match(resp.StatusCode)
+	retryable := rs != nil && resp.StatusCode != http.StatusSwitchingProtocols &&
+		rs.codes.Match(resp.StatusCode)
+	if failCodeHit || retryable {
+		if failCodeHit {
+			log.Warnf("failCodes matched status %d for node %s", resp.StatusCode, node.Name)
+		} else {
+			log.Warnf("retry code matched status %d for node %s with no retry budget left", resp.StatusCode, node.Name)
+		}
 		if marker := node.Marker(); marker != nil {
 			marker.Mark()
 		}
 		shouldClose = true
+	} else if marker := node.Marker(); marker != nil {
+		// Any other response proves the node is reachable and serving, so it
+		// clears the failure count. This is the success signal that keeps
+		// maxFails meaningful: a successful dial no longer resets the marker.
+		marker.Reset()
 	}
 
 	if log.IsLevelEnabled(logger.TraceLevel) {
@@ -686,10 +930,10 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 
 	// Response cache: tee the final (post-rewrite) response so a copy is
 	// captured while it streams to the client, then store it on success.
-	var writeTarget io.Writer = rw
+	var writeTarget io.Writer = closeOnErrorWriter{w: rw, conn: cc}
 	var tee *httpcache.TeeWriter
 	if h.Cache != nil && h.Cache.Cacheable(req, resp) {
-		tee = h.Cache.TeeWriter(rw)
+		tee = h.Cache.TeeWriter(writeTarget)
 		writeTarget = tee
 	}
 
@@ -723,6 +967,54 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 	}
 
 	return
+}
+
+// recordDialFailure records a request that failed before an upstream
+// connection was established. The HTTP path normally records inside
+// httpRoundTrip, which a dial failure never reaches; without this row the
+// failure is invisible to the outer handler's recorder, which sees a zero
+// Time and skips the object.
+func (h *Sniffer) recordDialFailure(ctx context.Context, req *http.Request, ro *xrecorder.HandlerRecorderObject, res *http.Response, err error, log logger.Logger) {
+	if h.Recorder == nil || ro == nil {
+		return
+	}
+	start := ro.Time
+	if start.IsZero() {
+		start = time.Now()
+	}
+	ro.Time = start
+	ro.Duration = time.Since(start)
+	ro.Err = err.Error()
+	// Rebuild the request object: a keep-alive connection can carry several
+	// requests, and a stale HTTP object would name the previous one. The
+	// attempts already discarded for this request belong to the row and must
+	// survive the rebuild.
+	var attempts []xrecorder.HTTPAttemptRecorderObject
+	if ro.HTTP != nil {
+		attempts = ro.HTTP.Attempts
+	}
+	ro.HTTP = &xrecorder.HTTPRecorderObject{
+		Host:   req.Host,
+		Proto:  req.Proto,
+		Scheme: req.URL.Scheme,
+		Method: req.Method,
+		URI:    req.RequestURI,
+		Request: xrecorder.HTTPRequestRecorderObject{
+			ContentLength: req.ContentLength,
+			Header:        req.Header.Clone(),
+		},
+		Attempts: attempts,
+	}
+	ro.HTTP.StatusCode = http.StatusServiceUnavailable
+	if res != nil && res.StatusCode != 0 {
+		ro.HTTP.StatusCode = res.StatusCode
+	}
+	if rerr := ro.Record(ctx, h.Recorder); rerr != nil && log != nil {
+		log.Errorf("record: %v", rerr)
+	}
+	// The caller records this object too unless Time is zero; clear it so the
+	// dial failure is recorded exactly once.
+	ro.Time = time.Time{}
 }
 
 // serveStale writes a stale (expired) cached response to the client when the

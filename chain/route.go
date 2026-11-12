@@ -24,6 +24,19 @@ var (
 	ErrEmptyRoute = errors.New("empty route")
 )
 
+// retryableHandshaker is implemented by errors that signal the enclosing
+// chain hop may retry the handshake once (e.g. TLS ECH retry configs).
+type retryableHandshaker interface {
+	RetryableHandshake() bool
+}
+
+// isRetryableHandshake reports whether err (or any error it wraps) signals a
+// retryable handshake failure.
+func isRetryableHandshake(err error) bool {
+	var e retryableHandshaker
+	return errors.As(err, &e) && e.RetryableHandshake()
+}
+
 var (
 	// DefaultRoute is a fallback route that dials the target directly
 	// without going through any proxy nodes.
@@ -59,11 +72,9 @@ func (*defaultRoute) Bind(ctx context.Context, network, address string, opts ...
 
 	switch network {
 	case "tcp", "tcp4", "tcp6":
-		addr, err := net.ResolveTCPAddr(network, address)
-		if err != nil {
-			return nil, err
-		}
-		return net.ListenTCP(network, addr)
+		lc := net.ListenConfig{}
+		lc.SetMultipathTCP(false)
+		return lc.Listen(context.Background(), network, address)
 	case "udp", "udp4", "udp6":
 		addr, err := net.ResolveUDPAddr(network, address)
 		if err != nil {
@@ -201,6 +212,7 @@ func (r *chainRoute) Bind(ctx context.Context, network, address string, opts ...
 func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn net.Conn, err error) {
 	network := "ip"
 	node := r.nodes[0]
+	failedNode := node
 
 	defer func() {
 		if r.options.Chain != nil {
@@ -208,19 +220,12 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 			if m, ok := r.options.Chain.(selector.Markable); ok && m != nil {
 				marker = m.Marker()
 			}
-			var name string
-			if cn, _ := r.options.Chain.(chainNamer); cn != nil {
-				name = cn.Name()
-			}
 			// chain error
 			if err != nil {
 				if marker != nil {
 					marker.Mark()
 				}
-				if v := xmetrics.GetCounter(xmetrics.MetricChainErrorsCounter,
-					metrics.Labels{"chain": name, "node": node.Name}); v != nil {
-					v.Inc()
-				}
+				r.recordChainError(failedNode)
 				return
 			}
 
@@ -230,7 +235,7 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		}
 	}()
 
-	addr, err := xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
+	addrs, err := xnet.ResolveAll(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
 	marker := node.Marker()
 	if err != nil {
 		if marker != nil {
@@ -240,17 +245,47 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 	}
 
 	start := time.Now()
-	cc, err := node.Options().Transport.Dial(ctx, addr)
-	if err != nil {
-		if marker != nil {
-			marker.Mark()
+	var cn net.Conn
+	for _, addr := range orderCandidates(node.Addr, addrs) {
+		if ctx.Err() != nil {
+			err = ctx.Err()
+			return
 		}
-		return
+		for attempt := 0; ; attempt++ {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+				break
+			}
+			cc, derr := node.Options().Transport.Dial(ctx, addr)
+			if derr != nil {
+				err = derr
+				// Dialers that complete the TLS handshake inside Dial (quic,
+				// grpc, h3, ...) report ECH retries from Dial, not Handshake.
+				if attempt == 0 && isRetryableHandshake(derr) {
+					continue
+				}
+				markAddrFailed(node.Addr, addr)
+				break
+			}
+			hn, herr := node.Options().Transport.Handshake(ctx, cc)
+			if herr == nil {
+				markAddrOK(node.Addr, addr)
+				cn, err = hn, nil
+				break
+			}
+			cc.Close()
+			err = herr
+			if attempt == 0 && isRetryableHandshake(herr) {
+				continue
+			}
+			markAddrFailed(node.Addr, addr)
+			break
+		}
+		if err == nil {
+			break
+		}
 	}
-
-	cn, err := node.Options().Transport.Handshake(ctx, cc)
 	if err != nil {
-		cc.Close()
 		if marker != nil {
 			marker.Mark()
 		}
@@ -260,19 +295,17 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 		marker.Reset()
 	}
 
-	if r.options.Chain != nil {
-		var name string
-		if cn, _ := r.options.Chain.(chainNamer); cn != nil {
-			name = cn.Name()
-		}
-		if v := xmetrics.GetObserver(xmetrics.MetricNodeConnectDurationObserver,
-			metrics.Labels{"chain": name, "node": node.Name}); v != nil {
-			v.Observe(time.Since(start).Seconds())
-		}
-	}
+	r.observeNodeConnectDuration(node, time.Since(start))
 
 	preNode := node
+	var (
+		addr string
+		cc   net.Conn
+	)
 	for _, node := range r.nodes[1:] {
+		failedNode = node
+		start := time.Now()
+
 		marker := node.Marker()
 		addr, err = xnet.Resolve(ctx, network, node.Addr, node.Options().Resolver, node.Options().HostMapper, logger)
 		if err != nil {
@@ -311,12 +344,42 @@ func (r *chainRoute) connect(ctx context.Context, logger logger.Logger) (conn ne
 			marker.Reset()
 		}
 
+		r.observeNodeConnectDuration(node, time.Since(start))
+
 		cn = cc
 		preNode = node
 	}
 
 	conn = cn
 	return
+}
+
+func (r *chainRoute) recordChainError(node *chain.Node) {
+	if r.options.Chain == nil || node == nil {
+		return
+	}
+	var name string
+	if cn, _ := r.options.Chain.(chainNamer); cn != nil {
+		name = cn.Name()
+	}
+	if v := xmetrics.GetCounter(xmetrics.MetricChainErrorsCounter,
+		metrics.Labels{"chain": name, "node": node.Name}); v != nil {
+		v.Inc()
+	}
+}
+
+func (r *chainRoute) observeNodeConnectDuration(node *chain.Node, d time.Duration) {
+	if r.options.Chain == nil || node == nil {
+		return
+	}
+	var name string
+	if cn, _ := r.options.Chain.(chainNamer); cn != nil {
+		name = cn.Name()
+	}
+	if v := xmetrics.GetObserver(xmetrics.MetricNodeConnectDurationObserver,
+		metrics.Labels{"chain": name, "node": node.Name}); v != nil {
+		v.Observe(d.Seconds())
+	}
 }
 
 func (r *chainRoute) getNode(index int) *chain.Node {

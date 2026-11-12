@@ -9,10 +9,9 @@ import (
 	xio "github.com/go-gost/x/internal/io"
 )
 
-const (
-	// tcpWaitTimeout implements a TCP half-close timeout.
-	tcpWaitTimeout = 10 * time.Second
-)
+// tcpWaitTimeout implements a TCP half-close timeout. It is a variable so
+// that tests can shorten it.
+var tcpWaitTimeout = 10 * time.Second
 
 // PipeOption configures the behaviour of Pipe.
 type PipeOption func(*pipeOptions)
@@ -115,17 +114,21 @@ func pipeHalf(ctx context.Context, src, dst io.ReadWriteCloser, readTimeout time
 
 			// 读取数据
 			nr, err := reader.Read(buf)
+
+			// A Read may return data together with an error (e.g. quic-go
+			// returns the last bytes of a stream together with io.EOF).
+			// Write the data first, otherwise the tail of the stream is lost.
+			if nr > 0 {
+				if _, werr := dst.Write(buf[:nr]); werr != nil {
+					return werr
+				}
+			}
+
 			if err != nil {
 				if err != io.EOF {
 					return err
 				}
 				return nil // 正常结束
-			}
-
-			// 写入数据
-			_, err = dst.Write(buf[:nr])
-			if err != nil {
-				return err
 			}
 		}
 	}
@@ -149,6 +152,14 @@ func (r *readDeadliner) Read(p []byte) (int, error) {
 
 // halfClose 执行TCP半关闭
 func halfClose(src, dst io.ReadWriteCloser) {
+	// The other half of the pipe writes to src. Bound those writes like the
+	// reads below: a peer that has stopped reading, or a multiplexed stream
+	// whose remote end is gone and will never grant more window, would
+	// otherwise block that goroutine (and Pipe) forever.
+	if wd, ok := src.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		wd.SetWriteDeadline(time.Now().Add(tcpWaitTimeout))
+	}
+
 	// 关闭读取端
 	if cr, ok := src.(xio.CloseRead); ok {
 		cr.CloseRead()

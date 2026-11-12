@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-gost/core/admission"
+	"github.com/go-gost/core/auth"
+	"github.com/go-gost/core/bypass"
 	"github.com/go-gost/core/handler"
 	"github.com/go-gost/core/hop"
 	"github.com/go-gost/core/listener"
@@ -16,6 +19,7 @@ import (
 	"github.com/go-gost/core/metadata"
 	reg "github.com/go-gost/core/registry"
 	"github.com/go-gost/x/config"
+	"github.com/go-gost/x/dashboard"
 	xlogger "github.com/go-gost/x/logger"
 	"github.com/go-gost/x/registry"
 
@@ -269,6 +273,136 @@ func TestRegister_Bypasses(t *testing.T) {
 	if !r.IsRegistered(name) {
 		t.Fatal("expected bypass to be registered")
 	}
+}
+
+func assertDashboardModule(t *testing.T, kind, name, service string, calls uint64) {
+	t.Helper()
+	snap := dashboard.Default().Snapshot()
+	for _, m := range snap.Modules {
+		if m.Kind == kind && m.Name == name && m.Service == service {
+			if m.Stats.Calls != calls {
+				t.Fatalf("%s/%s calls = %d, want %d", kind, name, m.Stats.Calls, calls)
+			}
+			return
+		}
+	}
+	t.Fatalf("module %s/%s service=%q not found in %+v", kind, name, service, snap.Modules)
+}
+
+func TestRegister_ModulesReportToDashboard(t *testing.T) {
+	dashboard.Enable(true)
+	t.Cleanup(func() {
+		dashboard.Enable(false)
+		dashboard.ResetState()
+	})
+
+	t.Run("bypass", func(t *testing.T) {
+		dashboard.ResetState()
+		name := "test-bypass-metrics"
+		r := registry.BypassRegistry()
+		t.Cleanup(func() { r.Unregister(name) })
+
+		if err := register(&config.Config{Bypasses: []*config.BypassConfig{{
+			Name:     name,
+			Matchers: []string{"127.0.0.1"},
+		}}}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		bp := r.Get(name)
+		if bp == nil {
+			t.Fatal("bypass not registered")
+		}
+		bp.Contains(context.Background(), "tcp", "127.0.0.1", bypass.WithService("svc"))
+		dashboard.Flush()
+		assertDashboardModule(t, "bypass", name, "svc", 1)
+	})
+
+	t.Run("admission", func(t *testing.T) {
+		dashboard.ResetState()
+		name := "test-admission-metrics"
+		r := registry.AdmissionRegistry()
+		t.Cleanup(func() { r.Unregister(name) })
+
+		if err := register(&config.Config{Admissions: []*config.AdmissionConfig{{
+			Name: name,
+		}}}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		adm := r.Get(name)
+		if adm == nil {
+			t.Fatal("admission not registered")
+		}
+		adm.Admit(context.Background(), "tcp", "127.0.0.1:1", admission.WithService("svc"))
+		dashboard.Flush()
+		assertDashboardModule(t, "admission", name, "svc", 1)
+	})
+
+	t.Run("hosts", func(t *testing.T) {
+		dashboard.ResetState()
+		name := "test-hosts-metrics"
+		r := registry.HostsRegistry()
+		t.Cleanup(func() { r.Unregister(name) })
+
+		if err := register(&config.Config{Hosts: []*config.HostsConfig{{
+			Name:     name,
+			Mappings: []*config.HostMappingConfig{{Hostname: "example.com", IP: "127.0.0.1"}},
+		}}}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		hm := r.Get(name)
+		if hm == nil {
+			t.Fatal("host mapper not registered")
+		}
+		hm.Lookup(context.Background(), "ip", "example.com")
+		dashboard.Flush()
+		assertDashboardModule(t, "hosts", name, "", 1)
+	})
+
+	t.Run("resolver", func(t *testing.T) {
+		dashboard.ResetState()
+		name := "test-resolver-metrics"
+		r := registry.ResolverRegistry()
+		t.Cleanup(func() { r.Unregister(name) })
+
+		if err := register(&config.Config{Resolvers: []*config.ResolverConfig{{
+			Name: name,
+		}}}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		rs := r.Get(name)
+		if rs == nil {
+			t.Fatal("resolver not registered")
+		}
+		rs.Resolve(context.Background(), "ip", "example.com")
+		dashboard.Flush()
+		assertDashboardModule(t, "resolver", name, "", 1)
+	})
+
+	t.Run("auther", func(t *testing.T) {
+		dashboard.ResetState()
+		name := "test-auther-metrics"
+		r := registry.AutherRegistry()
+		t.Cleanup(func() { r.Unregister(name) })
+
+		if err := register(&config.Config{Authers: []*config.AutherConfig{{
+			Name:  name,
+			Auths: []*config.AuthConfig{{Username: "u", Password: "p"}},
+		}}}); err != nil {
+			t.Fatalf("register: %v", err)
+		}
+
+		au := r.Get(name)
+		if au == nil {
+			t.Fatal("auther not registered")
+		}
+		au.Authenticate(context.Background(), "u", "p", auth.WithService("svc"))
+		dashboard.Flush()
+		assertDashboardModule(t, "auther", name, "svc", 1)
+	})
 }
 
 func TestRegister_Resolvers(t *testing.T) {
@@ -561,16 +695,18 @@ func TestRegister_Chains(t *testing.T) {
 // stubListener satisfies listener.Listener for testing.
 type stubListener struct{}
 
-func (l *stubListener) Init(md metadata.Metadata) error                 { return nil }
-func (l *stubListener) Accept() (net.Conn, error)                       { return nil, net.ErrClosed }
-func (l *stubListener) Addr() net.Addr                                  { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
-func (l *stubListener) Close() error                                    { return nil }
+func (l *stubListener) Init(md metadata.Metadata) error { return nil }
+func (l *stubListener) Accept() (net.Conn, error)       { return nil, net.ErrClosed }
+func (l *stubListener) Addr() net.Addr                  { return &net.TCPAddr{IP: net.IPv4zero, Port: 0} }
+func (l *stubListener) Close() error                    { return nil }
 
 // stubHandler satisfies handler.Handler for testing.
 type stubHandler struct{}
 
-func (h *stubHandler) Init(md metadata.Metadata) error                  { return nil }
-func (h *stubHandler) Handle(_ context.Context, _ net.Conn, _ ...handler.HandleOption) error { return nil }
+func (h *stubHandler) Init(md metadata.Metadata) error { return nil }
+func (h *stubHandler) Handle(_ context.Context, _ net.Conn, _ ...handler.HandleOption) error {
+	return nil
+}
 
 func TestRegister_Services(t *testing.T) {
 	// ParseService needs "tcp" listener and "auto" handler in registries.
@@ -744,6 +880,45 @@ func TestLoad_EmptyConfig(t *testing.T) {
 	}
 }
 
+// An unsupported auth file format must fail the config load, so that the
+// operator learns about the typo at startup instead of finding out that
+// nobody can authenticate.
+func TestLoad_InvalidAutherFormat(t *testing.T) {
+	cfg := &config.Config{
+		Authers: []*config.AutherConfig{
+			{
+				Name: "auther-0",
+				File: &config.FileLoader{
+					Path:   "/tmp/auth.txt",
+					Format: "toml",
+				},
+			},
+		},
+	}
+	if err := Load(cfg); err == nil {
+		t.Fatal("expected an error for an unsupported auth format")
+	} else {
+		t.Logf("got: %v", err)
+	}
+}
+
+func TestLoad_ValidAutherFormat(t *testing.T) {
+	cfg := &config.Config{
+		Authers: []*config.AutherConfig{
+			{
+				Name: "auther-0",
+				File: &config.FileLoader{
+					Path:   "/tmp/auth.txt",
+					Format: "json",
+				},
+			},
+		},
+	}
+	if err := Load(cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestLoad_WithTLS(t *testing.T) {
 	// BuildDefaultTLSConfig with nil TLS falls back to default cert/key files
 	// which don't exist, but it then generates a self-signed cert, so it
@@ -807,11 +982,11 @@ func newCountingRegistry[T any]() *countingRegistry[T] {
 	return &countingRegistry[T]{m: make(map[string]T)}
 }
 
-func (r *countingRegistry[T]) Register(name string, v T) error      { r.m[name] = v; return nil }
-func (r *countingRegistry[T]) Unregister(name string)                { delete(r.m, name); r.close++ }
-func (r *countingRegistry[T]) IsRegistered(name string) bool         { _, ok := r.m[name]; return ok }
-func (r *countingRegistry[T]) Get(name string) T                     { return r.m[name] }
-func (r *countingRegistry[T]) GetAll() map[string]T                  { return r.m }
+func (r *countingRegistry[T]) Register(name string, v T) error { r.m[name] = v; return nil }
+func (r *countingRegistry[T]) Unregister(name string)          { delete(r.m, name); r.close++ }
+func (r *countingRegistry[T]) IsRegistered(name string) bool   { _, ok := r.m[name]; return ok }
+func (r *countingRegistry[T]) Get(name string) T               { return r.m[name] }
+func (r *countingRegistry[T]) GetAll() map[string]T            { return r.m }
 
 func TestRegisterGroup_UnregistersAllOldEntries(t *testing.T) {
 	r := newCountingRegistry[int]()

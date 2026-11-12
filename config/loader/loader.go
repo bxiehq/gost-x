@@ -49,6 +49,7 @@ import (
 	router_parser "github.com/go-gost/x/config/parsing/router"
 	sd_parser "github.com/go-gost/x/config/parsing/sd"
 	service_parser "github.com/go-gost/x/config/parsing/service"
+	"github.com/go-gost/x/dashboard"
 	quota "github.com/go-gost/x/limiter/quota"
 	xp2p "github.com/go-gost/x/p2p"
 	"github.com/go-gost/x/registry"
@@ -152,7 +153,11 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[auth.Authenticator]
 		for _, c := range cfg.Authers {
-			entries = append(entries, named[auth.Authenticator]{c.Name, auth_parser.ParseAuther(c)})
+			a, err := auth_parser.ParseAutherWithError(c)
+			if err != nil {
+				return err
+			}
+			entries = append(entries, named[auth.Authenticator]{c.Name, dashboard.WrapAuther(c.Name, a)})
 		}
 		if err := registerGroup(entries, registry.AutherRegistry()); err != nil {
 			return err
@@ -162,7 +167,7 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[admission.Admission]
 		for _, c := range cfg.Admissions {
-			entries = append(entries, named[admission.Admission]{c.Name, admission_parser.ParseAdmission(c)})
+			entries = append(entries, named[admission.Admission]{c.Name, dashboard.WrapAdmission(c.Name, admission_parser.ParseAdmission(c))})
 		}
 		if err := registerGroup(entries, registry.AdmissionRegistry()); err != nil {
 			return err
@@ -172,7 +177,7 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[bypass.Bypass]
 		for _, c := range cfg.Bypasses {
-			entries = append(entries, named[bypass.Bypass]{c.Name, bypass_parser.ParseBypass(c)})
+			entries = append(entries, named[bypass.Bypass]{c.Name, dashboard.WrapBypass(c.Name, bypass_parser.ParseBypass(c))})
 		}
 		if err := registerGroup(entries, registry.BypassRegistry()); err != nil {
 			return err
@@ -186,7 +191,7 @@ func register(cfg *config.Config) error {
 			if err != nil {
 				return err
 			}
-			entries = append(entries, named[resolver.Resolver]{c.Name, r})
+			entries = append(entries, named[resolver.Resolver]{c.Name, dashboard.WrapResolver(c.Name, r)})
 		}
 		if err := registerGroup(entries, registry.ResolverRegistry()); err != nil {
 			return err
@@ -196,7 +201,7 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[hosts.HostMapper]
 		for _, c := range cfg.Hosts {
-			entries = append(entries, named[hosts.HostMapper]{c.Name, hosts_parser.ParseHostMapper(c)})
+			entries = append(entries, named[hosts.HostMapper]{c.Name, dashboard.WrapHosts(c.Name, hosts_parser.ParseHostMapper(c))})
 		}
 		if err := registerGroup(entries, registry.HostsRegistry()); err != nil {
 			return err
@@ -286,7 +291,7 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[traffic.TrafficLimiter]
 		for _, c := range cfg.Limiters {
-			entries = append(entries, named[traffic.TrafficLimiter]{c.Name, limiter_parser.ParseTrafficLimiter(c)})
+			entries = append(entries, named[traffic.TrafficLimiter]{c.Name, dashboard.WrapTrafficLimiter(c.Name, limiter_parser.ParseTrafficLimiter(c))})
 		}
 		if err := registerGroup(entries, registry.TrafficLimiterRegistry()); err != nil {
 			return err
@@ -306,7 +311,7 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[conn.ConnLimiter]
 		for _, c := range cfg.CLimiters {
-			entries = append(entries, named[conn.ConnLimiter]{c.Name, limiter_parser.ParseConnLimiter(c)})
+			entries = append(entries, named[conn.ConnLimiter]{c.Name, dashboard.WrapConnLimiter(c.Name, limiter_parser.ParseConnLimiter(c))})
 		}
 		if err := registerGroup(entries, registry.ConnLimiterRegistry()); err != nil {
 			return err
@@ -316,7 +321,7 @@ func register(cfg *config.Config) error {
 	{
 		var entries []named[rate.RateLimiter]
 		for _, c := range cfg.RLimiters {
-			entries = append(entries, named[rate.RateLimiter]{c.Name, limiter_parser.ParseRateLimiter(c)})
+			entries = append(entries, named[rate.RateLimiter]{c.Name, dashboard.WrapRateLimiter(c.Name, limiter_parser.ParseRateLimiter(c))})
 		}
 		if err := registerGroup(entries, registry.RateLimiterRegistry()); err != nil {
 			return err

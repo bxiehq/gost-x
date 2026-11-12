@@ -4,6 +4,7 @@ import (
 	"time"
 
 	mdata "github.com/go-gost/core/metadata"
+	"github.com/go-gost/x/internal/util/ech"
 	"github.com/go-gost/x/internal/util/mux"
 	mdutil "github.com/go-gost/x/metadata/util"
 )
@@ -16,6 +17,8 @@ type metadata struct {
 	keepaliveIdle     time.Duration
 	keepaliveInterval time.Duration
 	keepaliveCount    int
+
+	ech ech.Config
 }
 
 func (d *mtlsDialer) parseMetadata(md mdata.Metadata) (err error) {
@@ -36,6 +39,10 @@ func (d *mtlsDialer) parseMetadata(md mdata.Metadata) (err error) {
 		MaxStreamBuffer:   mdutil.GetInt(md, "mux.maxStreamBuffer"),
 		Type:              mdutil.GetString(md, "mux.type"),
 		MaxStreamWindow:   mdutil.GetInt(md, "mux.maxStreamWindow"),
+		OpenTimeout:       mdutil.GetDuration(md, "mux.openTimeout"),
+		StallWindow:       mdutil.GetDuration(md, "mux.stallWindow"),
 	}
+
+	d.md.ech = ech.FromMetadata(md)
 	return
 }

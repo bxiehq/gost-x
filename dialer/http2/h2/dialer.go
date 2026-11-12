@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -16,6 +15,7 @@ import (
 	"github.com/go-gost/core/logger"
 	md "github.com/go-gost/core/metadata"
 	xctx "github.com/go-gost/x/ctx"
+	"github.com/go-gost/x/internal/net/httptunnel"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	"github.com/go-gost/x/registry"
 	"golang.org/x/net/http2"
@@ -67,7 +67,10 @@ func (d *h2Dialer) Init(md md.Metadata) (err error) {
 		return
 	}
 
-	return nil
+	if d.h2c {
+		return nil
+	}
+	return d.md.ech.Init(d.logger, d.options.TLSConfig)
 }
 
 // Multiplex implements dialer.Multiplexer interface.
@@ -91,7 +94,12 @@ func (d *h2Dialer) Dial(ctx context.Context, address string, opts ...dialer.Dial
 			opt(options)
 		}
 
-		client = &http.Client{}
+		client = &http.Client{
+			// A tunnel request carries its data in its body, so a followed
+			// redirect would return a connection with a dead write side.
+			// Report the redirect as a failed attempt instead.
+			CheckRedirect: httptunnel.NoRedirect,
+		}
 		if d.h2c {
 			client.Transport = &http2.Transport{
 				AllowHTTP: true,
@@ -111,8 +119,21 @@ func (d *h2Dialer) Dial(ctx context.Context, address string, opts ...dialer.Dial
 				},
 			}
 		} else {
+			serverName := d.md.host
+			if serverName == "" {
+				if h, _, err := net.SplitHostPort(address); err == nil {
+					serverName = h
+				} else {
+					serverName = address
+				}
+			}
+			tlsCfg, err := d.md.ech.Apply(ctx, d.options.TLSConfig, serverName)
+			if err != nil {
+				d.clientMutex.Unlock()
+				return nil, err
+			}
 			client.Transport = &http.Transport{
-				TLSClientConfig: d.options.TLSConfig,
+				TLSClientConfig: tlsCfg,
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					conn, err := options.Dialer.Dial(ctx, network, addr)
 					if err != nil {
@@ -148,13 +169,20 @@ func (d *h2Dialer) Dial(ctx context.Context, address string, opts ...dialer.Dial
 	if d.h2c {
 		scheme = "http"
 	}
-	pr, pw := io.Pipe()
+	// The request body is the client-to-server half of the tunnel. Nothing is
+	// written to it before Dial returns, so when the transport retries the
+	// request on another connection (the server sent GOAWAY, or the
+	// connection broke, before this stream was opened), a fresh pipe is an
+	// exact replacement. Without GetBody the retry reuses the body the first
+	// attempt already closed (golang/go#82177).
+	body := httptunnel.NewBody()
 	req := &http.Request{
-		Method: http.MethodConnect,
-		URL:    &url.URL{Scheme: scheme, Host: host},
-		Header: d.md.header,
-		Body:   pr,
-		Host:   host,
+		Method:  http.MethodConnect,
+		URL:     &url.URL{Scheme: scheme, Host: host},
+		Header:  d.md.header,
+		Body:    body.Reader(),
+		GetBody: body.GetBody,
+		Host:    host,
 	}
 	if req.Header == nil {
 		req.Header = make(http.Header)
@@ -171,6 +199,23 @@ func (d *h2Dialer) Dial(ctx context.Context, address string, opts ...dialer.Dial
 
 	resp, err := client.Do(req.WithContext(context.WithoutCancel(ctx)))
 	if err != nil {
+		body.CloseWithError(err)
+		if !d.h2c {
+			serverName := d.md.host
+			if serverName == "" {
+				if h, _, err2 := net.SplitHostPort(address); err2 == nil {
+					serverName = h
+				} else {
+					serverName = address
+				}
+			}
+			if rerr := d.md.ech.OnDialError(ctx, err, serverName); rerr != nil {
+				d.clientMutex.Lock()
+				delete(d.clients, address)
+				d.clientMutex.Unlock()
+				return nil, rerr
+			}
+		}
 		return nil, err
 	}
 
@@ -181,12 +226,14 @@ func (d *h2Dialer) Dial(ctx context.Context, address string, opts ...dialer.Dial
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, errors.New(resp.Status)
+		err := errors.New(resp.Status)
+		body.CloseWithError(err)
+		return nil, err
 	}
 
 	conn := &http2Conn{
 		r:          resp.Body,
-		w:          pw,
+		w:          body.Writer(),
 		remoteAddr: raddr,
 		localAddr:  &net.TCPAddr{IP: net.IPv4zero, Port: 0},
 	}
